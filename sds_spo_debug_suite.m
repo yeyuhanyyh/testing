@@ -1,52 +1,84 @@
 function OUT = sds_spo_debug_suite(expType, userCfg)
 %==========================================================================
-% SDS + SPO+ DEBUG SUITE
+% SDS + SPO+ DEBUG SUITE (STRICT TWO-STAGE VERSION)
 %
-% One-file, debug-friendly implementation for both:
 %   expType = 'v1' : low-affine-dimension warm-up
-%   expType = 'v2' : full-dimensional ellipsoidal prior + canonical lifting
+%   expType = 'v2' : full-dimensional Euclidean-ball-prior experiment
 %
-% Key features:
-%   - true conditional mean is LINEAR;
-%   - Stage I is Algorithm-2-like:
-%       OLS --> pseudo-costs --> cumulative warm-start pointwise updates;
-%   - no full path enumeration; shortest-path oracle is DP on a monotone DAG;
-%   - risk is plotted at EVERY iteration;
-%   - dim(W) is plotted only in the EARLY iterations;
-%   - all main parameters are easy to tune in default_cfg().
+% STRICT TWO-STAGE AT EACH PREFIX t:
+%   For each t = 1,2,...,nTrain:
 %
-% IMPORTANT HONEST NOTE:
-%   The Stage-I learner below is NOT the exact FI/facet-hit Algorithm 1/2
-%   from the paper. It is an oracle-based approximation that is much closer
-%   to Algorithm 2 than an SVD basis learner:
+%   Stage I:
+%       - fit centered OLS on the first t labeled samples
+%       - generate pseudo-costs on the first t fresh discovery contexts
+%       - run Algorithm-2-like cumulative learner from scratch
+%       - freeze the learned subspace Uhat_t
+%
+%   Stage II:
+%       - train FULL SPO+ from scratch on the first t labeled samples
+%       - train COMPRESSED SPO+ from scratch on the first t labeled samples
+%         with Uhat_t fixed
+%
+% This is therefore a STRICT two-stage implementation.
+%
+% IMPORTANT HONEST NOTE
+%   Stage I below is NOT the exact FI/facet-hit Algorithm 1/2 from the paper.
+%   It is an oracle-based approximate separation version:
 %
 %       current D  --warm start-->
 %       pseudo-cost c_hat
-%       search for witness costs inside the measurement fiber
-%       if a witness changes the optimal path, append path-difference query
+%       search for witness costs inside the current measurement fiber
+%       if a witness changes the optimal path, append x_w - x_ref
+%
+%   So it is much closer to Algorithm 2 than an SVD basis learner, but it
+%   is still an approximation.
+%
+% IMPORTANT NO-LEAK FIX
+%   Stage II and evaluation DO NOT access:
+%       - prob.prior
+%       - prob.Ustar
+%       - corridorEdges
+%       - affine-hull information
+%
+%   They only access:
+%       - c0
+%       - predRadius
+%
+%   Hence the full baseline is not secretly projected onto the true affine
+%   hull, and the compressed baseline is not secretly corrected by the true
+%   subspace either.
 %
 % Usage:
-%   OUT1 = sds_spo_debug_suite('v1');
-%   OUT2 = sds_spo_debug_suite('v2');
+%   R1 = sds_spo_debug_suite('v1');
+%   R2 = sds_spo_debug_suite('v2');
 %
-% Override parameters by passing a struct, e.g.
-%   cfg = struct;
+% Example override:
+%   cfg = struct();
 %   cfg.g = 20;
 %   cfg.p = 8;
-%   cfg.nTrain = 300;
+%   cfg.nTrain = 150;
+%   cfg.nTrial = 2;
 %   cfg.data = struct('dstarTarget', 8);
-%   OUT = sds_spo_debug_suite('v2', cfg);
+%   cfg.stage1 = struct('numPasses', 1, 'numRandomFiberDirs', 16);
+%   cfg.stage2 = struct('numEpochsFull', 3, 'numEpochsRed', 3, 'batchSize', 32);
+%   R = sds_spo_debug_suite('v2', cfg);
 %==========================================================================
 
 if nargin < 1 || isempty(expType)
     expType = 'v2';
 end
-if nargin < 2
+if nargin < 2 || isempty(userCfg)
     userCfg = struct();
 end
 
 cfg = default_cfg(expType);
 cfg = merge_struct(cfg, userCfg);
+
+% Keep Stage-II prediction radius synced to data prior radius unless
+% the user explicitly overrides stage2.predRadius.
+if ~isfield(userCfg, 'stage2') || ~isfield(userCfg.stage2, 'predRadius')
+    cfg.stage2.predRadius = cfg.data.priorRadius;
+end
 
 validate_cfg(cfg);
 rng(cfg.seed, 'twister');
@@ -54,19 +86,25 @@ rng(cfg.seed, 'twister');
 edge = build_grid_edge_maps(cfg.g);
 prob = build_problem(cfg, edge);
 
+stage2Spec = struct();
+stage2Spec.c0 = prob.c0;
+stage2Spec.predRadius = cfg.stage2.predRadius;
+
 fprintf('\n============================================================\n');
-fprintf('Running SDS/SPO debug suite | expType = %s\n', upper(cfg.expType));
+fprintf('Running STRICT two-stage SDS/SPO debug suite | expType = %s\n', upper(cfg.expType));
 fprintf('Grid g = %d | ambient d = %d | target d* = %d | p = %d\n', ...
     cfg.g, edge.d, prob.trueDstar, cfg.p);
 fprintf('nTrain = %d | nTest = %d | nTrial = %d\n', ...
     cfg.nTrain, cfg.nTest, cfg.nTrial);
-fprintf('Stage I: ridge = %.2e | random fiber dirs = %d | max adds/sample = %d\n', ...
-    cfg.stage1.ridge, cfg.stage1.numRandomFiberDirs, cfg.stage1.maxAddsPerSample);
-fprintf('Stage II: full updates/iter = %d | red updates/iter = %d\n', ...
-    cfg.stage2.fullUpdatesPerIter, cfg.stage2.redUpdatesPerIter);
+fprintf('Stage I: ridge = %.2e | passes = %d | maxDiscoveryPerT = %s\n', ...
+    cfg.stage1.ridge, cfg.stage1.numPasses, num2str_inf(cfg.stage1.maxDiscoveryPerT));
+fprintf('         randFiberDirs = %d | maxAdds/sample = %d\n', ...
+    cfg.stage1.numRandomFiberDirs, cfg.stage1.maxAddsPerSample);
+fprintf('Stage II: numEpochsFull = %d | numEpochsRed = %d | batchSize = %d | predRadius = %.3f\n', ...
+    cfg.stage2.numEpochsFull, cfg.stage2.numEpochsRed, cfg.stage2.batchSize, cfg.stage2.predRadius);
 fprintf('============================================================\n\n');
 
-OUT = run_all_trials(cfg, prob, edge);
+OUT = run_all_trials(cfg, prob, edge, stage2Spec);
 
 end
 
@@ -77,57 +115,62 @@ end
 function cfg = default_cfg(expType)
 
 cfg = struct();
-cfg.expType = lower(string(expType));
+cfg.expType = lower(char(expType));
 
 % ----------------------------- global ------------------------------------
-cfg.seed       = 20260313;
-cfg.g          = 20;      % number of nodes per side
-cfg.p          = 8;       % context dimension; choose >= dstarTarget if you want full d*
-cfg.nTrain     = 300;
-cfg.nTest      = 400;
-cfg.nTrial     = 5;
+cfg.seed         = 20260313;
+cfg.g            = 20;       % number of nodes per side
+cfg.p            = 8;        % choose >= dstarTarget if you want all d* activated
+cfg.nTrain       = 300;      % strict two-stage at every prefix can be expensive
+cfg.nTest        = 300;
+cfg.nTrial       = 3;
+cfg.verboseEvery = 25;
 
 cfg.plot = struct();
 cfg.plot.dimPlotMax  = 12;      % only show dim(W) in first few iterations
 cfg.plot.saveFigures = false;
 cfg.plot.resultsDir  = 'results';
-cfg.plot.showCIBand  = false;   % set true if you want CI ribbons
 
 % ----------------------------- data --------------------------------------
 cfg.data = struct();
 
-cfg.data.dstarTarget = 8;       % target decision-relevant dimension
-cfg.data.baselineLow = 10;
+cfg.data.dstarTarget  = 8;      % target decision-relevant dimension
+cfg.data.baselineLow  = 10;
 cfg.data.baselineHigh = 100;
 
 % prior radius:
 %   v1: latent affine-ball radius
-%   v2: Euclidean-ball radius around c0 (an ellipsoid with Sigma = rho^2 I)
+%   v2: Euclidean ball radius around c0
 cfg.data.priorRadius = 0.90;
 
-% linear conditional-mean amplitude:
-% if xi in [-1,1]^p, then ||(muScale/sqrt(p))*A*xi|| <= muScale
+% true linear conditional mean:
+%   mu(x) = c0 + U* A x
+% with bounded contexts x in [-1,1]^p and row-orthonormal A
 cfg.data.muScale = 0.45;
 
-% zero-mean latent noise (preserves linear conditional mean)
+% bounded zero-mean latent noise
 cfg.data.latentNoiseScale = 0.15;
 
-% extra orthogonal nuisance noise for v2 only (also zero-mean)
+% extra zero-mean orthogonal nuisance noise for v2 only
 cfg.data.nuisanceScale = 0.10;
 
 % ----------------------------- stage I -----------------------------------
 cfg.stage1 = struct();
 
-% OLS for centered linear model
+% centered OLS
 cfg.stage1.ridge = 1e-6;
 
+% strict two-stage Stage-I controls
+cfg.stage1.numPasses         = 1;     % passes over the pseudo-cost stream
+cfg.stage1.maxDiscoveryPerT  = inf;   % use first min(t, maxDiscoveryPerT) discovery contexts
+
 % Algorithm-2-like cumulative learner
-cfg.stage1.numRandomFiberDirs = 32;
+cfg.stage1.numRandomFiberDirs = 24;
 cfg.stage1.maxAddsPerSample   = 2;
 cfg.stage1.alphaList          = [1.00, 0.50, 0.25];
 cfg.stage1.linDepTol          = 1e-8;
 
-% optional cap to prevent runaway basis growth during debugging
+% optional cap on learned basis size
 cfg.stage1.maxBasisDim = inf;
 
 % ----------------------------- stage II ----------------------------------
@@ -136,21 +179,22 @@ cfg.stage2 = struct();
 cfg.stage2.lrFull = 0.040;
 cfg.stage2.lrRed  = 0.060;
 
-% online replay SGD
-cfg.stage2.replayWindow      = 40;
-cfg.stage2.fullUpdatesPerIter = 1;
-cfg.stage2.redUpdatesPerIter  = 1;
+cfg.stage2.numEpochsFull = 3;
+cfg.stage2.numEpochsRed  = 3;
+cfg.stage2.batchSize     = 32;
+cfg.stage2.gradClip      = 5.0;
 
-cfg.stage2.gradClip = 5.0;
+% IMPORTANT:
+%   This is the only constraint Stage II sees.
+%   It is an ambient Euclidean ball around c0, NOT the data prior projector.
+cfg.stage2.predRadius = cfg.data.priorRadius;
 
 % ------------------------- experiment-specific ---------------------------
 switch cfg.expType
-    case "v1"
-        % warm-up: low-affine-dim prior
+    case 'v1'
         cfg.p = max(cfg.p, cfg.data.dstarTarget);
 
-    case "v2"
-        % main: full-dimensional ellipsoidal prior + canonical lifting
+    case 'v2'
         cfg.p = max(cfg.p, cfg.data.dstarTarget);
 
     otherwise
@@ -161,7 +205,7 @@ end
 
 function validate_cfg(cfg)
 
-if ~(cfg.expType == "v1" || cfg.expType == "v2")
+if ~(strcmp(cfg.expType, 'v1') || strcmp(cfg.expType, 'v2'))
     error('cfg.expType must be "v1" or "v2".');
 end
 
@@ -169,7 +213,7 @@ if cfg.g < 4
     error('Need g >= 4.');
 end
 
-maxGadgets = floor((cfg.g - 1)/2);
+maxGadgets = floor((cfg.g - 1) / 2);
 if cfg.data.dstarTarget > maxGadgets
     error(['For the current diagonal gadget construction, dstarTarget <= floor((g-1)/2). ' ...
            'Current max = %d, requested = %d.'], maxGadgets, cfg.data.dstarTarget);
@@ -183,10 +227,22 @@ if cfg.data.muScale + cfg.data.latentNoiseScale >= cfg.data.priorRadius
     error('Need muScale + latentNoiseScale < priorRadius.');
 end
 
-if cfg.expType == "v2"
+if strcmp(cfg.expType, 'v2')
     if cfg.data.muScale + cfg.data.latentNoiseScale + cfg.data.nuisanceScale >= cfg.data.priorRadius
         error('Need muScale + latentNoiseScale + nuisanceScale < priorRadius for v2.');
     end
+end
+
+if cfg.stage2.predRadius <= 0
+    error('stage2.predRadius must be positive.');
+end
+
+if cfg.stage2.batchSize < 1
+    error('stage2.batchSize must be >= 1.');
+end
+
+if cfg.stage1.numPasses < 1
+    error('stage1.numPasses must be >= 1.');
 end
 
 end
@@ -195,9 +251,10 @@ end
 % MAIN DRIVER
 %==========================================================================
 
-function OUT = run_all_trials(cfg, prob, edge)
+function OUT = run_all_trials(cfg, prob, edge, stage2Spec)
 
 T = cfg.nTrain;
+
 riskFull = zeros(cfg.nTrial, T);
 riskRed  = zeros(cfg.nTrial, T);
 dimHist  = zeros(cfg.nTrial, T);
@@ -207,86 +264,69 @@ trialDetail = cell(cfg.nTrial, 1);
 
 for tr = 1:cfg.nTrial
     fprintf('=== Trial %d / %d ===\n', tr, cfg.nTrial);
-    rng(cfg.seed + 1000*tr, 'twister');
+    rng(cfg.seed + 1000 * tr, 'twister');
 
     % ---------- build one linear ground-truth contextual model ----------
-    Atrue = make_full_row_rank_rows(prob.trueDstar, cfg.p);           % d* x p
-    Atrue = (cfg.data.muScale / sqrt(cfg.p)) * Atrue;                 % ensure bounded linear mean
+    Atrue = make_full_row_rank_rows(prob.trueDstar, cfg.p);      % d* x p
+    Atrue = (cfg.data.muScale / sqrt(cfg.p)) * Atrue;            % bounded linear mean
 
     % ---------- data ----------
-    Xtr   = sample_contexts(cfg.nTrain, cfg.p);
-    Xdisc = sample_contexts(cfg.nTrain, cfg.p);  % fresh discovery contexts for Algorithm-4-style Stage I
+    Xlab  = sample_contexts(cfg.nTrain, cfg.p);
+    Xdisc = sample_contexts(cfg.nTrain, cfg.p);   % fresh discovery contexts
     Xte   = sample_contexts(cfg.nTest,  cfg.p);
 
-    Ctr = generate_costs_from_contexts(Xtr,   Atrue, prob, cfg);
-    Cte = generate_costs_from_contexts(Xte,   Atrue, prob, cfg);
+    Clab = generate_costs_from_contexts(Xlab, Atrue, prob, cfg);
+    Cte  = generate_costs_from_contexts(Xte,  Atrue, prob, cfg);
 
-    % ---------- Stage I + Stage II states ----------
-    D      = sparse(edge.d, 0);  % cumulative query dataset
-    Uhat   = zeros(edge.d, 0);
-    Uprev  = zeros(edge.d, 0);
-
-    Bfull  = zeros(edge.d, cfg.p + 1);  % full ambient linear predictor
-    Gred   = zeros(0,      cfg.p + 1);  % reduced coordinate predictor
-
-    addCountPerIter = zeros(1, T);
-    dimPerIter      = zeros(1, T);
+    dimPerIter  = zeros(1, T);
+    addPerIter  = zeros(1, T);
 
     for t = 1:T
         % ================================================================
-        % Stage I (Algorithm-4-like):
-        %   1) fit centered OLS on seen labeled data
-        %   2) form pseudo-cost from fresh discovery context
-        %   3) run cumulative warm-start pointwise learner on pseudo-cost
+        % STRICT STAGE I:
+        %   learn Uhat_t from scratch using only the prefix 1:t
         % ================================================================
-        Ahat = fit_centered_ols(Xtr(1:t,:), Ctr(1:t,:), prob.c0, cfg.stage1.ridge);
+        [Uhat, infoStage1] = learn_subspace_two_stage( ...
+            Xlab(1:t,:), Clab(1:t,:), Xdisc(1:t,:), prob, edge, cfg.stage1);
 
-        cPseudo = prob.c0 + Ahat * Xdisc(t,:)';
-        cPseudo = project_to_prior(cPseudo, prob.prior);
-
-        [D, infoStage1] = stage1_update_alg2like(cPseudo, D, prob.prior, edge, cfg.stage1);
-
-        Uhat = orth(full(D));
-
-        if infoStage1.numAdded > 0
-            Gred = change_reduced_basis(Gred, Uprev, Uhat, cfg.p + 1);
-            Uprev = Uhat;
-        end
-
-        addCountPerIter(t) = infoStage1.numAdded;
-        dimPerIter(t)      = size(Uhat, 2);
+        dimPerIter(t) = size(Uhat, 2);
+        addPerIter(t) = infoStage1.totalAdded;
 
         % ================================================================
-        % Stage II:
-        %   online replay SGD on the SPO+ surrogate
+        % STRICT STAGE II:
+        %   with Uhat_t FIXED, train full / compressed models from scratch
+        %   on the same prefix 1:t
         % ================================================================
-        [Bfull, Gred] = stage2_online_updates(Bfull, Gred, Uhat, ...
-            Xtr, Ctr, t, prob, edge, cfg.stage2);
+        Bfull = train_full_model_two_stage( ...
+            Xlab(1:t,:), Clab(1:t,:), stage2Spec, edge, cfg.stage2);
+
+        Gred = train_reduced_model_two_stage( ...
+            Xlab(1:t,:), Clab(1:t,:), Uhat, stage2Spec, edge, cfg.stage2);
 
         % ================================================================
         % Evaluate at EVERY iteration
         % ================================================================
-        riskFull(tr, t) = mean_spo_risk_full(Bfull, Xte, Cte, prob, edge);
-        riskRed(tr,  t) = mean_spo_risk_red(Gred, Uhat, Xte, Cte, prob, edge);
+        riskFull(tr, t) = mean_spo_risk_full(Bfull, Xte, Cte, stage2Spec, edge);
+        riskRed(tr,  t) = mean_spo_risk_red(Gred, Uhat, Xte, Cte, stage2Spec, edge);
 
-        if mod(t, 25) == 0 || t <= 10 || t == T
-            fprintf('  t=%3d | dim(W)=%2d | hard_add=%d | riskF=%.4g | riskR=%.4g\n', ...
-                t, dimPerIter(t), addCountPerIter(t), riskFull(tr,t), riskRed(tr,t));
+        if mod(t, cfg.verboseEvery) == 0 || t <= 10 || t == T
+            fprintf('  t=%3d | dim(W)=%2d | stage1Adds=%2d | riskF=%.4g | riskR=%.4g\n', ...
+                t, dimPerIter(t), addPerIter(t), riskFull(tr,t), riskRed(tr,t));
         end
     end
 
-    hardHist(tr,:) = addCountPerIter;
+    hardHist(tr,:) = addPerIter;
     dimHist(tr,:)  = dimPerIter;
 
     detail = struct();
     detail.Atrue = Atrue;
-    detail.Xtr = Xtr;
-    detail.Ctr = Ctr;
+    detail.Xlab = Xlab;
+    detail.Clab = Clab;
     detail.Xdisc = Xdisc;
     detail.Xte = Xte;
     detail.Cte = Cte;
-    detail.addCountPerIter = addCountPerIter;
     detail.dimPerIter = dimPerIter;
+    detail.stage1AddPerIter = addPerIter;
     trialDetail{tr} = detail;
 
     fprintf('\n');
@@ -311,13 +351,13 @@ paramRatioTrue = edge.d / prob.trueDstar;
 boundRatioTrue = sqrt(edge.d / prob.trueDstar);
 
 fprintf('------------------------------------------------------------\n');
-fprintf('ambient d                  = %d\n', edge.d);
-fprintf('true d*                    = %d\n', prob.trueDstar);
-fprintf('parameter ratio d/d*       = %.4f\n', paramRatioTrue);
-fprintf('bound-term ratio sqrt(d/d*)= %.4f\n', boundRatioTrue);
+fprintf('ambient d                    = %d\n', edge.d);
+fprintf('true d*                      = %d\n', prob.trueDstar);
+fprintf('parameter ratio d/d*         = %.4f\n', paramRatioTrue);
+fprintf('bound-term ratio sqrt(d/d*)  = %.4f\n', boundRatioTrue);
 fprintf('empirical risk ratio at final iter (Full/Reduced) = %.4f +/- %.4f (90%% CI)\n', ...
     meanRiskRatio(end), ciRiskRatio(end));
-fprintf('mean final learned dim(W)  = %.4f\n', meanDim(end));
+fprintf('mean final learned dim(W)    = %.4f\n', meanDim(end));
 fprintf('------------------------------------------------------------\n');
 
 % ------------------------------- plots -----------------------------------
@@ -328,6 +368,8 @@ OUT = struct();
 OUT.cfg = cfg;
 OUT.prob = prob;
 OUT.edge = edge;
+OUT.stage2Spec = stage2Spec;
+
 OUT.riskFull = riskFull;
 OUT.riskRed  = riskRed;
 OUT.dimHist  = dimHist;
@@ -355,7 +397,7 @@ end
 function prob = build_problem(cfg, edge)
 
 switch cfg.expType
-    case "v1"
+    case 'v1'
         % Low-affine-dimension warm-up:
         %   C = { c0 + U*z : ||z|| <= rho }, so affdim(C) = d*
         [Ustar, gadgetInfo] = build_diagonal_switch_basis(edge, cfg.data.dstarTarget);
@@ -365,7 +407,7 @@ switch cfg.expType
         prior = struct();
         prior.kind   = 'affine_ball';
         prior.c0     = c0;
-        prior.Uaff   = Ustar;                 % known affine hull in this warm-up experiment
+        prior.Uaff   = Ustar;                 % used only by DATA + Stage I
         prior.radius = cfg.data.priorRadius;
 
         prob = struct();
@@ -373,12 +415,12 @@ switch cfg.expType
         prob.c0 = c0;
         prob.prior = prior;
         prob.Ustar = Ustar;
-        prob.trueDstar = size(Ustar,2);
+        prob.trueDstar = size(Ustar, 2);
         prob.gadgetInfo = gadgetInfo;
 
-    case "v2"
-        % Full-dimensional ellipsoidal prior:
-        %   C = { c : ||c-c0||_2 <= rho }, affdim(C)=d
+    case 'v2'
+        % Full-dimensional Euclidean-ball prior:
+        %   C = { c : ||c-c0||_2 <= rho }, affdim(C) = d
         % c0 is corridor-like so all shortest paths stay in a narrow family.
         [corrInfo, corridorEdges, Ustar] = build_diagonal_corridor(edge, cfg.data.dstarTarget);
 
@@ -386,7 +428,7 @@ switch cfg.expType
         c0(corridorEdges) = cfg.data.baselineLow;
 
         prior = struct();
-        prior.kind   = 'euclid_ball';         % ellipsoid with Sigma = rho^2 I
+        prior.kind   = 'euclid_ball';
         prior.c0     = c0;
         prior.radius = cfg.data.priorRadius;
 
@@ -395,7 +437,7 @@ switch cfg.expType
         prob.c0 = c0;
         prob.prior = prior;
         prob.Ustar = Ustar;
-        prob.trueDstar = size(Ustar,2);
+        prob.trueDstar = size(Ustar, 2);
         prob.corridorEdges = corridorEdges;
         prob.corrInfo = corrInfo;
 
@@ -408,9 +450,8 @@ end
 end
 
 function verify_corridor_margin(cfg, edge)
-L = 2*(cfg.g - 1);
+L = 2 * (cfg.g - 1);
 
-% conservative worst/best check
 maxCorrCost = L * (cfg.data.baselineLow  + cfg.data.priorRadius);
 minOneOutCost = (cfg.data.baselineHigh - cfg.data.priorRadius) + ...
                 (L - 1) * (cfg.data.baselineLow - cfg.data.priorRadius);
@@ -426,14 +467,19 @@ end
 %==========================================================================
 
 function X = sample_contexts(n, p)
-% bounded contexts so the true conditional mean stays exactly linear
-X = 2*rand(n, p) - 1;   % Uniform[-1,1]^p
+% bounded contexts so the conditional mean remains exactly linear
+X = 2 * rand(n, p) - 1;   % Uniform[-1,1]^p
 end
 
 function C = generate_costs_from_contexts(X, Atrue, prob, cfg)
 % TRUE MODEL:
 %   mu(x) = c0 + U_star * (Atrue * x)
-% plus zero-mean noise that preserves linear conditional mean
+% plus zero-mean noise that preserves linear conditional mean.
+%
+% Because we enforce
+%   muScale + latentNoiseScale (+ nuisanceScale) < priorRadius,
+% the projection to the prior should almost never be active in normal runs.
+% Hence the conditional mean is effectively linear.
 
 n = size(X,1);
 d = numel(prob.c0);
@@ -444,17 +490,16 @@ C = zeros(n, d);
 for i = 1:n
     xi = X(i,:)';
 
-    zMean = Atrue * xi;   % linear in context
+    zMean = Atrue * xi;   % linear in context, bounded in norm by muScale
 
-    % latent zero-mean bounded noise
-    zNoise = (cfg.data.latentNoiseScale / sqrt(r)) * (2*rand(r,1) - 1);
+    % zero-mean bounded latent noise, norm <= latentNoiseScale
+    zNoise = (cfg.data.latentNoiseScale / sqrt(r)) * (2 * rand(r,1) - 1);
 
-    if prob.name == "Version 1"
+    if strcmp(prob.name, 'Version 1')
         c = prob.c0 + prob.Ustar * (zMean + zNoise);
 
-    elseif prob.name == "Version 2"
-        % extra zero-mean orthogonal nuisance noise so realized costs need
-        % not lie exactly in span(U_star), but E[c|x] still does.
+    elseif strcmp(prob.name, 'Version 2')
+        % zero-mean orthogonal nuisance noise with norm <= nuisanceScale
         v = randn(d,1);
         v = v - prob.Ustar * (prob.Ustar' * v);
         nv = norm(v);
@@ -463,7 +508,7 @@ for i = 1:n
         else
             v = zeros(d,1);
         end
-        orthNoise = cfg.data.nuisanceScale * (2*rand - 1) * v;
+        orthNoise = cfg.data.nuisanceScale * (2 * rand - 1) * v;
 
         c = prob.c0 + prob.Ustar * (zMean + zNoise) + orthNoise;
 
@@ -492,17 +537,59 @@ A = Q.';               % r x p
 end
 
 %==========================================================================
-% STAGE I: OLS + ALGORITHM-2-LIKE CUMULATIVE LEARNER
+% STRICT STAGE I
 %==========================================================================
+
+function [Uhat, info] = learn_subspace_two_stage(Xlab, Clab, Xdisc, prob, edge, s1)
+% STRICT TWO-STAGE Stage I at a fixed sample size t:
+%   - fit centered OLS on (Xlab, Clab)
+%   - form pseudo-costs on Xdisc
+%   - run Algorithm-2-like cumulative learner FROM SCRATCH
+%   - return the frozen learned subspace Uhat
+
+Ahat = fit_centered_ols(Xlab, Clab, prob.c0, s1.ridge);
+
+nDiscAvail = size(Xdisc, 1);
+nDiscUse = min(nDiscAvail, s1.maxDiscoveryPerT);
+
+D = sparse(edge.d, 0);
+totalAdded = 0;
+
+for pass = 1:s1.numPasses
+    for j = 1:nDiscUse
+        cPseudo = prob.c0 + Ahat * Xdisc(j,:)';
+        cPseudo = project_to_prior(cPseudo, prob.prior);
+
+        [D, info1] = stage1_update_alg2like(cPseudo, D, prob.prior, edge, s1);
+        totalAdded = totalAdded + info1.numAdded;
+
+        if size(D,2) >= s1.maxBasisDim
+            break;
+        end
+    end
+
+    if size(D,2) >= s1.maxBasisDim
+        break;
+    end
+end
+
+Uhat = orth(full(D));
+
+info = struct();
+info.totalAdded = totalAdded;
+info.dim = size(Uhat, 2);
+info.Ahat = Ahat;
+
+end
 
 function Ahat = fit_centered_ols(X, C, c0, ridge)
 % centered multi-response OLS:
 %   c - c0 = A_mu * x + eps
 
-[n, p] = size(X);
+[~, p] = size(X);
 d = size(C, 2);
 
-if n == 0
+if isempty(X)
     Ahat = zeros(d, p);
     return;
 end
@@ -535,7 +622,7 @@ for kk = 1:s1.maxAddsPerSample
         break;
     end
 
-    D = [D, sparse(qNew)];
+    D = [D, sparse(qNew)]; %#ok<AGROW>
     info.numAdded = info.numAdded + 1;
     info.hard = true;
 end
@@ -575,11 +662,6 @@ end
 end
 
 function cands = sample_fiber_witnesses(cRef, D, prior, s1)
-% Generate candidate witness costs INSIDE the current fiber:
-%   q^T c' = q^T cRef for all q in D.
-%
-% This is done by random directions in the fiber tangent space, followed by
-% line-search to the prior boundary.
 
 switch prior.kind
     case 'euclid_ball'
@@ -598,12 +680,12 @@ function cands = sample_fiber_witnesses_euclid_ball(cRef, D, prior, s1)
 d = numel(cRef);
 cands = zeros(d, 0);
 
-Uq = orth(full(D));   % span of current queried directions
+Uq = orth(full(D));   % span of current query directions
 
 for kk = 1:s1.numRandomFiberDirs
     r = randn(d,1);
     if ~isempty(Uq)
-        r = r - Uq * (Uq.' * r);  % ensure fiber-preserving direction
+        r = r - Uq * (Uq.' * r);  % keep q^T c unchanged for all q in D
     end
     nr = norm(r);
     if nr < 1e-12
@@ -624,25 +706,24 @@ for kk = 1:s1.numRandomFiberDirs
     end
 end
 
-% include current point as a harmless fallback
 cands(:,end+1) = cRef;
 end
 
 function cands = sample_fiber_witnesses_affine_ball(cRef, D, prior, s1)
 
-U = prior.Uaff;                      % d x r_aff
-zc = U.' * (cRef - prior.c0);        % latent coordinate in affine hull
-rAff = size(U,2);
+U = prior.Uaff;
+zc = U.' * (cRef - prior.c0);   % latent coordinate in affine hull
+rAff = size(U, 2);
 
 cands = zeros(size(U,1), 0);
 
-M = full(D).' * U;                   % t x r_aff
-Ur = orth(M.');                      % row-space basis in latent coordinates
+M = full(D).' * U;              % t x rAff
+Ur = orth(M.');                 % basis for row-space of M inside R^{rAff}
 
 for kk = 1:s1.numRandomFiberDirs
     zdir = randn(rAff, 1);
     if ~isempty(Ur)
-        zdir = zdir - Ur * (Ur.' * zdir);  % preserve q^T c
+        zdir = zdir - Ur * (Ur.' * zdir);  % preserve all q^T c measurements
     end
     nz = norm(zdir);
     if nz < 1e-12
@@ -673,8 +754,8 @@ a = delta.' * delta;
 b = 2 * (u.' * delta);
 cc = (u.' * u) - prior.radius^2;
 
-disc = max(b^2 - 4*a*cc, 0);
-tau = max(0, (-b + sqrt(disc)) / (2*a));
+disc = max(b^2 - 4 * a * cc, 0);
+tau = max(0, (-b + sqrt(disc)) / (2 * a));
 end
 
 function tau = max_step_latent_ball(z, dz, rho)
@@ -682,8 +763,8 @@ a = dz.' * dz;
 b = 2 * (z.' * dz);
 cc = (z.' * z) - rho^2;
 
-disc = max(b^2 - 4*a*cc, 0);
-tau = max(0, (-b + sqrt(disc)) / (2*a));
+disc = max(b^2 - 4 * a * cc, 0);
+tau = max(0, (-b + sqrt(disc)) / (2 * a));
 end
 
 function tf = independent_from_span(q, D, tol)
@@ -700,97 +781,138 @@ tf = norm(res, 2) > tol * max(1, norm(q,2));
 end
 
 %==========================================================================
-% STAGE II: ONLINE SPO+ TRAINING
+% STRICT STAGE II
 %==========================================================================
 
-function [Bfull, Gred] = stage2_online_updates(Bfull, Gred, Uhat, Xtr, Ctr, t, prob, edge, s2)
+function Bfull = train_full_model_two_stage(X, C, stage2Spec, edge, s2)
+% Train FULL SPO+ from scratch on the given prefix dataset.
+% NO-LEAK: only c0 and predRadius are used.
 
-ids0 = max(1, t - s2.replayWindow + 1);
-pool = ids0:t;
+[n, p] = size(X);
+Bfull = zeros(edge.d, p + 1);
 
-etaF = s2.lrFull / sqrt(t);
-etaR = s2.lrRed  / sqrt(t);
-
-% ------------------------------- full model ------------------------------
-for uu = 1:s2.fullUpdatesPerIter
-    i = pool(randi(numel(pool)));
-
-    phi = [Xtr(i,:)'; 1];
-    c   = Ctr(i,:)';
-
-    chat = prob.c0 + Bfull * phi;
-    chat = project_to_prior(chat, prob.prior);
-
-    v = spoplus_subgrad_dp(chat, c, edge);
-    Grad = full(v) * phi.';
-
-    gnorm = norm(Grad(:), 2);
-    if gnorm > s2.gradClip
-        Grad = Grad * (s2.gradClip / gnorm);
-    end
-
-    Bfull = Bfull - etaF * Grad;
+if n == 0
+    return;
 end
 
-% ----------------------------- reduced model -----------------------------
+for ep = 1:s2.numEpochsFull
+    eta = s2.lrFull / sqrt(ep);
+    perm = randperm(n);
+
+    for s = 1:s2.batchSize:n
+        ids = perm(s : min(s + s2.batchSize - 1, n));
+        Grad = zeros(edge.d, p + 1);
+
+        for kk = 1:numel(ids)
+            i = ids(kk);
+            phi = [X(i,:)'; 1];
+            c   = C(i,:)';
+
+            chat = predict_full_noleak(Bfull, phi, stage2Spec);
+            v = spoplus_subgrad_dp(chat, c, edge);
+            Grad = Grad + full(v) * phi.';
+        end
+
+        Grad = Grad / numel(ids);
+        gnorm = norm(Grad(:), 2);
+        if gnorm > s2.gradClip
+            Grad = Grad * (s2.gradClip / gnorm);
+        end
+
+        Bfull = Bfull - eta * Grad;
+    end
+end
+end
+
+function Gred = train_reduced_model_two_stage(X, C, Uhat, stage2Spec, edge, s2)
+% Train COMPRESSED SPO+ from scratch on the given prefix dataset,
+% with Uhat fixed throughout Stage II.
+% NO-LEAK: no access to prob.prior / Ustar / corridor information.
+
+[~, p] = size(X);
+
 if isempty(Uhat)
+    Gred = zeros(0, p + 1);
     return;
 end
 
-if isempty(Gred)
-    Gred = zeros(size(Uhat,2), size(Xtr,2)+1);
+n = size(X,1);
+r = size(Uhat,2);
+
+Gred = zeros(r, p + 1);
+
+if n == 0
+    return;
 end
 
-for uu = 1:s2.redUpdatesPerIter
-    i = pool(randi(numel(pool)));
+for ep = 1:s2.numEpochsRed
+    eta = s2.lrRed / sqrt(ep);
+    perm = randperm(n);
 
-    phi = [Xtr(i,:)'; 1];
-    c   = Ctr(i,:)';
+    for s = 1:s2.batchSize:n
+        ids = perm(s : min(s + s2.batchSize - 1, n));
+        Grad = zeros(r, p + 1);
 
-    s = Gred * phi;
-    s = project_reduced_coordinate(s, prob.prior);
+        for kk = 1:numel(ids)
+            i = ids(kk);
+            phi = [X(i,:)'; 1];
+            c   = C(i,:)';
 
-    % canonical lifting:
-    %   for v2, Sigma = rho^2 I, so LU = Uhat
-    %   for v1 affine-ball warm-up, lift also reduces to c0 + Uhat s
-    chat = prob.c0 + Uhat * s;
-    chat = project_to_prior(chat, prob.prior);
+            chat = predict_red_noleak(Gred, Uhat, phi, stage2Spec);
+            v = spoplus_subgrad_dp(chat, c, edge);
+            Grad = Grad + (Uhat.' * full(v)) * phi.';
+        end
 
-    v = spoplus_subgrad_dp(chat, c, edge);
-    Grad = (Uhat.' * full(v)) * phi.';
+        Grad = Grad / numel(ids);
+        gnorm = norm(Grad(:), 2);
+        if gnorm > s2.gradClip
+            Grad = Grad * (s2.gradClip / gnorm);
+        end
 
-    gnorm = norm(Grad(:), 2);
-    if gnorm > s2.gradClip
-        Grad = Grad * (s2.gradClip / gnorm);
+        Gred = Gred - eta * Grad;
     end
-
-    Gred = Gred - etaR * Grad;
+end
 end
 
+function chat = predict_full_noleak(Bfull, phi, stage2Spec)
+% Full ambient model constrained only by an ambient Euclidean ball around c0.
+% No Ustar / no affine hull / no corridor information is used.
+
+delta = Bfull * phi;
+delta = project_ball_centered(delta, stage2Spec.predRadius);
+chat  = stage2Spec.c0 + delta;
 end
 
-function Gnew = change_reduced_basis(Gold, Uold, Unew, phiDim)
-% Re-express the old reduced predictor in the new basis after Stage I
-% appends a new query direction.
-if isempty(Unew)
-    Gnew = zeros(0, phiDim);
+function chat = predict_red_noleak(Gred, Uhat, phi, stage2Spec)
+% Reduced model uses ONLY the learned subspace Uhat.
+% Again: no true-Ustar projector and no data-prior projector.
+
+if isempty(Uhat) || isempty(Gred)
+    chat = stage2Spec.c0;
     return;
 end
 
-if isempty(Uold) || isempty(Gold)
-    Gnew = zeros(size(Unew,2), phiDim);
-    return;
+s = Gred * phi;
+s = project_ball_centered(s, stage2Spec.predRadius);
+
+% Since Uhat is orthonormal, ||Uhat*s||_2 = ||s||_2 <= predRadius.
+chat = stage2Spec.c0 + Uhat * s;
 end
 
-Fambient = Uold * Gold;    % d x (p+1)
-Gnew = Unew.' * Fambient;  % since Unew is orthonormal and Sigma = scalar*I
+function y = project_ball_centered(x, radius)
+nx = norm(x, 2);
+if nx <= radius || nx < 1e-12
+    y = x;
+else
+    y = (radius / nx) * x;
+end
 end
 
 %==========================================================================
 % RISK / LOSS / ORACLE
 %==========================================================================
 
-function risk = mean_spo_risk_full(Bfull, X, C, prob, edge)
+function risk = mean_spo_risk_full(Bfull, X, C, stage2Spec, edge)
 
 n = size(X,1);
 tot = 0;
@@ -798,8 +920,7 @@ tot = 0;
 for i = 1:n
     phi  = [X(i,:)'; 1];
     c    = C(i,:)';
-    chat = prob.c0 + Bfull * phi;
-    chat = project_to_prior(chat, prob.prior);
+    chat = predict_full_noleak(Bfull, phi, stage2Spec);
 
     tot = tot + spo_loss_dp(chat, c, edge);
 end
@@ -807,7 +928,7 @@ end
 risk = tot / n;
 end
 
-function risk = mean_spo_risk_red(Gred, Uhat, X, C, prob, edge)
+function risk = mean_spo_risk_red(Gred, Uhat, X, C, stage2Spec, edge)
 
 n = size(X,1);
 tot = 0;
@@ -816,15 +937,7 @@ for i = 1:n
     phi = [X(i,:)'; 1];
     c   = C(i,:)';
 
-    if isempty(Uhat)
-        chat = prob.c0;
-    else
-        s = Gred * phi;
-        s = project_reduced_coordinate(s, prob.prior);
-        chat = prob.c0 + Uhat * s;
-        chat = project_to_prior(chat, prob.prior);
-    end
-
+    chat = predict_red_noleak(Gred, Uhat, phi, stage2Spec);
     tot = tot + spo_loss_dp(chat, c, edge);
 end
 
@@ -839,7 +952,7 @@ end
 
 function v = spoplus_subgrad_dp(chat, ctrue, edge)
 [~, x0] = oracle_monotone_path_dp(ctrue, edge);
-[~, x1] = oracle_monotone_path_dp(2*chat - ctrue, edge);
+[~, x1] = oracle_monotone_path_dp(2 * chat - ctrue, edge);
 v = 2 * (x0 - x1);
 end
 
@@ -904,6 +1017,15 @@ end
 %==========================================================================
 
 function cProj = project_to_prior(c, prior)
+%==========================================================================
+% DATA / STAGE-I ONLY
+%
+% DO NOT use this in Stage II.
+%
+% In Version 1, prior.kind = 'affine_ball' contains prior.Uaff = Ustar.
+% If Stage II calls this projector, the predictor is secretly projected
+% onto the true affine hull, which leaks the true subspace.
+%==========================================================================
 
 switch prior.kind
     case 'euclid_ball'
@@ -922,31 +1044,6 @@ switch prior.kind
             z = (prior.radius / nz) * z;
         end
         cProj = prior.c0 + prior.Uaff * z;
-
-    otherwise
-        error('Unknown prior kind.');
-end
-
-end
-
-function sProj = project_reduced_coordinate(s, prior)
-
-switch prior.kind
-    case 'euclid_ball'
-        ns = norm(s, 2);
-        if ns <= prior.radius
-            sProj = s;
-        else
-            sProj = (prior.radius / ns) * s;
-        end
-
-    case 'affine_ball'
-        ns = norm(s, 2);
-        if ns <= prior.radius
-            sProj = s;
-        else
-            sProj = (prior.radius / ns) * s;
-        end
 
     otherwise
         error('Unknown prior kind.');
@@ -986,7 +1083,6 @@ end
 
 function [Ustar, info] = build_diagonal_switch_basis(edge, m)
 % m disjoint 2x2 switch gadgets on the diagonal
-g = edge.g;
 
 Q = zeros(edge.d, m);
 squareTL = zeros(m, 2);
@@ -1094,22 +1190,22 @@ function make_plots(cfg, prob, edge, riskFull, riskRed, dimHist)
 x = 1:cfg.nTrain;
 eps0 = 1e-12;
 
-mF = mean(log10(riskFull + eps0), 1, 'omitnan');
-mR = mean(log10(riskRed  + eps0), 1, 'omitnan');
+[mF, ciF] = mean_ci90(log10(riskFull + eps0));
+[mR, ciR] = mean_ci90(log10(riskRed  + eps0));
 
 fig1 = figure('Name', sprintf('%s: test SPO risk', prob.name));
 hold on; grid on; box on;
-plot(x, mF, 'LineWidth', 1.6);
-plot(x, mR, 'LineWidth', 1.6);
+errorbar(x, mF, ciF, 'LineWidth', 1.2);
+errorbar(x, mR, ciR, 'LineWidth', 1.2);
 xlabel('# labeled training samples');
 ylabel('log10(Test SPO risk)');
 legend({'Full SPO+', 'Compressed SPO+ after learned subspace'}, 'Location', 'best');
 
 switch cfg.expType
-    case "v1"
-        title(sprintf('Version 1 | g=%d, d=%d, affdim(C)=d^*= %d', ...
+    case 'v1'
+        title(sprintf('Version 1 | g=%d, d=%d, affdim(C)=d^*=%d', ...
             cfg.g, edge.d, prob.trueDstar));
-    case "v2"
+    case 'v2'
         title(sprintf('Version 2 | g=%d, d=%d, true d^*=%d, affdim(C)=d', ...
             cfg.g, edge.d, prob.trueDstar));
 end
@@ -1134,8 +1230,8 @@ if cfg.plot.saveFigures
     if exist(cfg.plot.resultsDir, 'dir') ~= 7
         mkdir(cfg.plot.resultsDir);
     end
-    save_figure(fig1, fullfile(cfg.plot.resultsDir, sprintf('%s_risk.png', lower(prob.name))));
-    save_figure(fig2, fullfile(cfg.plot.resultsDir, sprintf('%s_dimW.png', lower(prob.name))));
+    save_figure(fig1, fullfile(cfg.plot.resultsDir, sprintf('%s_risk.png', lower(strrep(prob.name, ' ', '_')))));
+    save_figure(fig2, fullfile(cfg.plot.resultsDir, sprintf('%s_dimW.png', lower(strrep(prob.name, ' ', '_')))));
 end
 
 end
@@ -1177,5 +1273,13 @@ for k = 1:numel(fn)
     else
         out.(f) = override.(f);
     end
+end
+end
+
+function s = num2str_inf(x)
+if isinf(x)
+    s = 'inf';
+else
+    s = num2str(x);
 end
 end
